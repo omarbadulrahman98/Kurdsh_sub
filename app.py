@@ -155,13 +155,42 @@ _TR_LOCK = threading.Lock()
 _CALL_POOL = ThreadPoolExecutor(max_workers=8)
 
 
+def _gtx_translate(text, source):
+    """ڕێگای دووەم بۆ گووگڵ (endpoint ی جیاواز لە deep-translator)."""
+    import requests
+
+    resp = requests.post(
+        "https://translate.googleapis.com/translate_a/single",
+        params={"client": "gtx", "sl": source, "tl": "ckb", "dt": "t"},
+        data={"q": text},
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=20,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"gtx HTTP {resp.status_code}")
+    data = resp.json()
+    out = "".join(seg[0] for seg in data[0] if seg and seg[0])
+    if not out.strip():
+        raise RuntimeError("gtx وەڵامی بەتاڵ")
+    return out
+
+
 def _google_call(text, source):
     """یەک داواکاری بۆ گووگڵ، بە سنووری کات (تا هەرگیز نەوەستێت) و ٣ هەوڵ."""
     for attempt in range(3):
         if TRANSLATE_STATS["ok"] == 0 and TRANSLATE_STATS["consecutive"] >= 4:
             return None  # گووگڵ ڕێگری دەکات؛ هەوڵی زیاتر بێ سوودە
         try:
-            fut = _CALL_POOL.submit(lambda: GoogleTranslator(source=source, target="ckb").translate(text))
+            def _do():
+                try:
+                    return GoogleTranslator(source=source, target="ckb").translate(text)
+                except Exception as first_error:
+                    try:
+                        return _gtx_translate(text, source)
+                    except Exception:
+                        raise first_error
+
+            fut = _CALL_POOL.submit(_do)
             result = fut.result(timeout=25)
             if result:
                 with _TR_LOCK:
