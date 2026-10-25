@@ -150,28 +150,80 @@ def get_model(name: str):
 # ───────────────────────── وەرگێڕان ─────────────────────────
 
 
-TRANSLATE_STATS = {"failed": 0, "last_error": ""}
+TRANSLATE_STATS = {"failed": 0, "last_error": "", "ok": 0, "consecutive": 0}
+_TR_LOCK = threading.Lock()
+_CALL_POOL = ThreadPoolExecutor(max_workers=8)
 
 
-def translate_google(texts, src_code):
-    source = src_code or "auto"
-
-    def one(text):
-        if not str(text).strip():
-            return text
-        for attempt in range(4):
-            try:
-                result = GoogleTranslator(source=source, target="ckb").translate(text)
-                if result:
-                    return result
-            except Exception as e:
+def _google_call(text, source):
+    """یەک داواکاری بۆ گووگڵ، بە سنووری کات (تا هەرگیز نەوەستێت) و ٣ هەوڵ."""
+    for attempt in range(3):
+        if TRANSLATE_STATS["ok"] == 0 and TRANSLATE_STATS["consecutive"] >= 4:
+            return None  # گووگڵ ڕێگری دەکات؛ هەوڵی زیاتر بێ سوودە
+        try:
+            fut = _CALL_POOL.submit(lambda: GoogleTranslator(source=source, target="ckb").translate(text))
+            result = fut.result(timeout=25)
+            if result:
+                with _TR_LOCK:
+                    TRANSLATE_STATS["ok"] += 1
+                    TRANSLATE_STATS["consecutive"] = 0
+                return result
+            raise RuntimeError("وەڵامی بەتاڵ")
+        except Exception as e:
+            with _TR_LOCK:
+                TRANSLATE_STATS["consecutive"] += 1
                 TRANSLATE_STATS["last_error"] = f"{type(e).__name__}: {e}"[:300]
-                time.sleep(1 + attempt)
-        TRANSLATE_STATS["failed"] += 1
-        return text
+            time.sleep(1 + attempt)
+    return None
+
+
+def translate_google(texts, src_code, on_progress=None):
+    source = src_code or "auto"
+    n = len(texts)
+    results = [None] * n
+
+    # چەند دێڕ لە یەک داواکاری (زۆر خێراتر). ئەگەر ژمارەی دێڕەکان نەگونجا، دێڕ بە دێڕ دەکرێت.
+    chunks, cur, cur_len = [], [], 0
+    for i, t in enumerate(texts):
+        t = str(t).replace("\n", " ").strip()
+        if cur and (len(cur) >= 20 or cur_len + len(t) > 3500):
+            chunks.append(cur)
+            cur, cur_len = [], 0
+        cur.append(i)
+        cur_len += len(t) + 1
+    if cur:
+        chunks.append(cur)
+
+    done = {"lines": 0}
+
+    def work(idx):
+        lines = [str(texts[i]).replace("\n", " ").strip() for i in idx]
+        if not any(lines):
+            for i in idx:
+                results[i] = texts[i]
+        else:
+            out = _google_call("\n".join(lines), source)
+            parts = out.split("\n") if out else []
+            if out and len(parts) == len(idx):
+                for i, part in zip(idx, parts):
+                    results[i] = part.strip() or texts[i]
+            else:
+                for i, line in zip(idx, lines):
+                    r = _google_call(line, source) if line else texts[i]
+                    if r is None:
+                        with _TR_LOCK:
+                            TRANSLATE_STATS["failed"] += 1
+                        r = texts[i]
+                    results[i] = r
+        with _TR_LOCK:
+            done["lines"] += len(idx)
+            frac = done["lines"] / max(n, 1)
+        if on_progress:
+            on_progress(min(frac, 1.0))
 
     with ThreadPoolExecutor(max_workers=3) as pool:
-        return list(pool.map(one, texts))
+        list(pool.map(work, chunks))
+    return results
 
 
 SYSTEM_PROMPT = (
@@ -357,8 +409,7 @@ def transcribe_whisper(url, duration, opts, bar):
 
 def translate_rows(rows, title, opts, status, bar):
     texts = [r["original"] for r in rows]
-    TRANSLATE_STATS["failed"] = 0
-    TRANSLATE_STATS["last_error"] = ""
+    TRANSLATE_STATS.update({"failed": 0, "last_error": "", "ok": 0, "consecutive": 0})
     glossary = parse_glossary(opts["glossary"])
     extra_fixes = {}
     bar.progress(0.72, text="خەریکی وەرگێڕانم بۆ کوردی سۆرانی...")
@@ -373,7 +424,7 @@ def translate_rows(rows, title, opts, status, bar):
         client = anthropic.Anthropic(api_key=opts["api_key"])
         translated = translate_claude(client, texts, title, opts["src_code"], glossary, on_progress)
     else:
-        translated = translate_google(texts, opts["src_code"])
+        translated = translate_google(texts, opts["src_code"], on_progress)
         on_progress(1.0)
 
     failed = TRANSLATE_STATS["failed"]
