@@ -6,7 +6,9 @@ import shutil
 import subprocess
 import tempfile
 import textwrap
+import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
@@ -453,12 +455,39 @@ def process_video(url, opts, status, bar):
 # ───────────────────────── دروستکردنی ڤیدیۆی ژێرنووسکراو ─────────────────────────
 
 
+def transcribe_groq(audio_path, src_code, api_key):
+    """Whisper لە ڕێگەی API ی Groq (زۆر خێرا، CPU ی ئەپەکە بەکارنایەت)."""
+    import requests
+
+    data = {
+        "model": "whisper-large-v3-turbo",
+        "response_format": "verbose_json",
+        "timestamp_granularities[]": "segment",
+        "temperature": "0",
+    }
+    if src_code:
+        data["language"] = src_code
+    with open(audio_path, "rb") as f:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            data=data,
+            files={"file": ("audio.mp3", f, "audio/mpeg")},
+            timeout=900,
+        )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Groq {resp.status_code}: {resp.text[:300]}")
+    js = resp.json()
+    rows = [
+        {"start": float(sg["start"]), "end": float(sg["end"]), "original": sg["text"].strip()}
+        for sg in js.get("segments", [])
+        if str(sg.get("text", "")).strip()
+    ]
+    return rows, js.get("language", "?")
+
+
 def process_upload(uploaded, opts, status, bar):
     """ڤیدیۆی ئەپلۆدکراو: دەنگ ← Whisper ← وەرگێڕان (بێ یوتوب)."""
-    if not whisper_available():
-        raise RuntimeError(
-            "faster-whisper دانەمەزراوە. لە requirements.txt دڵنیابە ئەم دێڕە هەیە: faster-whisper>=1.0.3"
-        )
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         raise RuntimeError("ffmpeg دانەمەزراوە. لە packages.txt دایبنێ.")
 
@@ -480,40 +509,66 @@ def process_upload(uploaded, opts, status, bar):
     title = os.path.splitext(uploaded.name)[0]
     status.write(f"**{title}** — {int(duration // 60)} خولەک")
 
-    bar.progress(0.06, text="خەریکی دەرهێنانی دەنگم...")
-    # دەنگ ڕاستەوخۆ بە ffmpeg دەخوێنینەوە (بێ پێویستی بە av ی faster-whisper)
-    r = subprocess.run(
-        ["ffmpeg", "-v", "error", "-i", local_path, "-vn", "-ac", "1", "-ar", "16000", "-f", "f32le", "-"],
-        capture_output=True,
-    )
-    if r.returncode != 0 or not r.stdout:
-        raise RuntimeError(
-            "دەنگ لەم ڤیدیۆیە دەرنەهات. دڵنیابە فایلەکە دەنگی تێدایە.\n" + r.stderr.decode("utf-8", "ignore")[-300:]
+    rows, lang_found = None, "?"
+
+    # ١. Groq (خێرا) ئەگەر کلیلەکە هەبێت
+    if opts.get("groq_key"):
+        try:
+            bar.progress(0.06, text="خەریکی دەرهێنانی دەنگم...")
+            with tempfile.TemporaryDirectory() as tmp:
+                mp3 = os.path.join(tmp, "audio.mp3")
+                r = subprocess.run(
+                    ["ffmpeg", "-v", "error", "-y", "-i", local_path, "-vn", "-ac", "1", "-ar", "16000",
+                     "-b:a", "24k", mp3],
+                    capture_output=True,
+                )
+                if r.returncode != 0 or not os.path.exists(mp3):
+                    raise RuntimeError("دەنگ دەرنەهات: " + r.stderr.decode("utf-8", "ignore")[-200:])
+                bar.progress(0.15, text="خەریکی گۆڕینی دەنگ بۆ دەقم (Groq)...")
+                rows, lang_found = transcribe_groq(mp3, opts["src_code"], opts["groq_key"])
+        except Exception as e:
+            status.write(f"⚠️ Groq سەرکەوتوو نەبوو ({str(e)[:200]})، Whisper ی ناوخۆیی بەکاردێت...")
+            rows = None
+
+    # ٢. Whisper ی ناوخۆیی (خاوتر)
+    if not rows:
+        if not whisper_available():
+            raise RuntimeError(
+                "faster-whisper دانەمەزراوە. لە requirements.txt دڵنیابە ئەم دێڕە هەیە: faster-whisper>=1.0.3"
+            )
+        bar.progress(0.06, text="خەریکی دەرهێنانی دەنگم...")
+        r = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", local_path, "-vn", "-ac", "1", "-ar", "16000", "-f", "f32le", "-"],
+            capture_output=True,
         )
-    import numpy as np
+        if r.returncode != 0 or not r.stdout:
+            raise RuntimeError(
+                "دەنگ لەم ڤیدیۆیە دەرنەهات. دڵنیابە فایلەکە دەنگی تێدایە.\n" + r.stderr.decode("utf-8", "ignore")[-300:]
+            )
+        import numpy as np
 
-    audio = np.frombuffer(r.stdout, dtype=np.float32)
+        audio = np.frombuffer(r.stdout, dtype=np.float32)
+        bar.progress(0.12, text="خەریکی گۆڕینی دەنگ بۆ دەقم (ئەمە کەمێک کات دەخایەنێت)...")
+        model = get_model(opts["whisper_model"])
+        segments, tinfo = model.transcribe(
+            audio,
+            language=opts["src_code"],
+            task="transcribe",
+            vad_filter=True,
+            beam_size=opts.get("beam_size", 5),
+            condition_on_previous_text=False,
+        )
+        rows = []
+        for seg in segments:
+            text = seg.text.strip()
+            if text:
+                rows.append({"start": seg.start, "end": seg.end, "original": text})
+            bar.progress(0.12 + 0.58 * min(seg.end / duration, 1.0), text="خەریکی گۆڕینی دەنگ بۆ دەقم...")
+        lang_found = getattr(tinfo, "language", "?")
 
-    bar.progress(0.12, text="خەریکی گۆڕینی دەنگ بۆ دەقم (ئەمە کەمێک کات دەخایەنێت)...")
-    model = get_model(opts["whisper_model"])
-    segments, tinfo = model.transcribe(
-        audio,
-        language=opts["src_code"],
-        task="transcribe",
-        vad_filter=True,
-        beam_size=opts.get("beam_size", 5),
-        condition_on_previous_text=False,
-    )
-    total = duration
-    rows = []
-    for seg in segments:
-        text = seg.text.strip()
-        if text:
-            rows.append({"start": seg.start, "end": seg.end, "original": text})
-        bar.progress(0.12 + 0.58 * min(seg.end / total, 1.0), text="خەریکی گۆڕینی دەنگ بۆ دەقم...")
     if not rows:
         raise RuntimeError("هیچ قسەیەک لە ڤیدیۆکەدا نەدۆزرایەوە.")
-    status.write(f"زمانی دۆزراوە: {getattr(tinfo, 'language', '?')}")
+    status.write(f"زمانی دۆزراوە: {lang_found}")
 
     df, _ = translate_rows(rows, title, opts, status, bar)
     ku_title = ""  # ناوی فایل سەرناوی ڕاستەقینە نییە؛ خۆت لە خانەی سەرناو بینووسە
@@ -751,6 +806,105 @@ def friendly_error(e: Exception) -> str:
     return msg
 
 
+# ───────────────────────── کارە پاشبنەماکان (بەردەوام دەبن ئەگەر لە پەڕەکە بچیتە دەرەوە) ─────────────────────────
+
+
+@st.cache_resource
+def job_store():
+    return {}
+
+
+class JobReporter:
+    """جێگرەوەی st.status و st.progress لەناو thread."""
+
+    def __init__(self, job):
+        self.job = job
+
+    def write(self, text):
+        self.job["log"].append(str(text))
+
+    def progress(self, frac, text=""):
+        self.job["frac"] = max(0.0, min(float(frac), 1.0))
+        if text:
+            self.job["text"] = text
+
+    def update(self, **kwargs):
+        pass
+
+
+class UploadedBytes:
+    """کۆپییەکی ناو بیرگە لە فایلی ئەپلۆدکراو، تا دوای ڕیرانی Streamlit بمێنێتەوە."""
+
+    def __init__(self, name, data):
+        self.name = name
+        self.data = data
+
+    def getbuffer(self):
+        return self.data
+
+
+def start_job(call, cleanup=None, meta=None):
+    store = job_store()
+    job_id = uuid.uuid4().hex[:10]
+    job = {
+        "state": "running", "frac": 0.0, "text": "دەستپێکردن...", "log": [],
+        "result": None, "error": None, "started": time.time(), "applied": False, "meta": meta or {},
+    }
+    store[job_id] = job
+    for old_id in list(store.keys())[:-6]:
+        store.pop(old_id, None)
+    rep = JobReporter(job)
+
+    def run():
+        try:
+            job["result"] = call(rep)
+            job["state"] = "done"
+        except Exception as e:  # noqa: BLE001
+            job["error"] = friendly_error(e)
+            job["state"] = "error"
+        finally:
+            if cleanup:
+                try:
+                    cleanup()
+                except Exception:
+                    pass
+
+    threading.Thread(target=run, daemon=True).start()
+    return job_id
+
+
+def poll_job(param):
+    """ئەگەر کارەکە تەواو بووبێت، job دەگەڕێنێتەوە. ئەگەر هێشتا کار دەکات، پێشان دەدات و دووبارە دەخوێنێتەوە."""
+    job_id = st.query_params.get(param)
+    if not job_id:
+        return None, None
+    job = job_store().get(job_id)
+    if job is None:
+        st.warning("ئەم کارە نەماوە (لەوانەیە ئەپەکە ڕیبووت بووبێت). دووبارە دەستپێبکەرەوە.")
+        st.query_params.pop(param, None)
+        return None, None
+    if job["state"] == "running":
+        elapsed = int(time.time() - job["started"])
+        with st.container(border=True):
+            st.write(f"⏳ خەریکی کارکردنم... ({elapsed // 60}:{elapsed % 60:02d})")
+            st.progress(job["frac"], text=job["text"])
+            for line in job["log"]:
+                st.write(line)
+            st.caption(
+                "دەتوانیت لەم پەڕەیە بچیتە دەرەوە و بگەڕێیتەوە، کارەکە بەردەوام دەبێت. "
+                "تەنها لینکی ئەم پەڕەیە (لەگەڵ ?%s=...) بپارێزە." % param
+            )
+        time.sleep(2)
+        st.rerun()
+    if job["state"] == "error":
+        st.error(job["error"])
+        return None, job_id
+    for line in job["log"]:
+        if line.startswith("⚠️"):
+            st.warning(line)
+    return job, job_id
+
+
 if "result" not in st.session_state:
     st.session_state.result = None
 
@@ -797,24 +951,29 @@ if go_up:
         if old and old.get("video_path") and os.path.exists(old["video_path"]):
             os.remove(old["video_path"])
         st.session_state.result = None
+        st.session_state.pop("loaded_job", None)
+        st.query_params.pop("rjob", None)
         api_key = get_api_key("") or secret("ANTHROPIC_API_KEY")
+        fast = up_speed.startswith("خێرا")
         uopts = {
             "src_code": LANGS[up_lang_label],
-            "whisper_model": "base" if up_speed.startswith("خێرا") else DEFAULTS["whisper_model"],
-            "beam_size": 1 if up_speed.startswith("خێرا") else 5,
+            "whisper_model": "base" if fast else DEFAULTS["whisper_model"],
+            "beam_size": 1 if fast else 5,
+            "groq_key": secret("GROQ_API_KEY"),
             "engine": "claude" if api_key else "google",
             "api_key": api_key,
             "max_minutes": DEFAULTS["max_minutes"],
             "glossary": "",
         }
-        with st.status("خەریکی دروستکردنی ژێرنووسم...", expanded=True) as status:
-            try:
-                bar = st.progress(0.0, text="دەستپێکردن...")
-                st.session_state.result = process_upload(up_file, uopts, status, bar)
-                status.update(label="ژێرنووسەکە ئامادەیە", state="complete", expanded=False)
-            except Exception as e:
-                status.update(label="سەرکەوتوو نەبوو", state="error", expanded=True)
-                st.error(friendly_error(e))
+        up_obj = UploadedBytes(up_file.name, up_file.getvalue())
+        jid = start_job(lambda rep: process_upload(up_obj, uopts, rep, rep))
+        st.query_params["job"] = jid
+        st.rerun()
+
+up_job, up_job_id = poll_job("job")
+if up_job is not None and st.session_state.get("loaded_job") != up_job_id:
+    st.session_state.result = up_job["result"]
+    st.session_state.loaded_job = up_job_id
 
 if go:
     url = url.strip()
@@ -827,6 +986,8 @@ if go:
         if old and old.get("video_path") and os.path.exists(old["video_path"]):
             os.remove(old["video_path"])
         st.session_state.result = None
+        st.query_params.pop("job", None)
+        st.query_params.pop("rjob", None)
 
         api_key = get_api_key("") or secret("ANTHROPIC_API_KEY")
         cookies_path = cookies_from_secret()
@@ -908,20 +1069,29 @@ if res:
                 "font": DEFAULTS["font"],
                 "cookies_path": cookies_path,
             }
-            rbar = st.progress(0.0, text="دەستپێکردن...")
-            try:
-                oldv = res.get("video_path")
-                if oldv and os.path.exists(oldv):
-                    os.remove(oldv)
-                res["video_path"] = render_video(
-                    res["url"], edited, title_text, ropts, rbar,
-                    upload=uploaded_video, local_path=res.get("local_path"),
-                )
-            except Exception as e:
-                st.error(friendly_error(e))
-            finally:
+            oldv = res.get("video_path")
+            if oldv and os.path.exists(oldv):
+                os.remove(oldv)
+            res["video_path"] = None
+            edited_copy = edited.copy()
+            up_copy = UploadedBytes(uploaded_video.name, uploaded_video.getvalue()) if uploaded_video else None
+            local_copy = res.get("local_path")
+            url_copy = res["url"]
+            title_copy = title_text
+
+            def _cleanup():
                 if cookies_path and os.path.exists(cookies_path):
                     os.remove(cookies_path)
+
+            rjid = start_job(
+                lambda rep: render_video(
+                    url_copy, edited_copy, title_copy, ropts, rep, upload=up_copy, local_path=local_copy
+                ),
+                cleanup=_cleanup,
+                meta={"res_id": res["id"]},
+            )
+            st.query_params["rjob"] = rjid
+            st.rerun()
 
         vp = res.get("video_path")
         if vp and os.path.exists(vp):
@@ -936,3 +1106,13 @@ if res:
                 key=f"dl_vid_{res['id']}_{res['rev']}",
                 use_container_width=True,
             )
+
+
+# ───────────────────────── کاری دروستکردنی ڤیدیۆ (لە کۆتاییدا، تا ئەنجامەکان لە سەرەوە دیار بن) ─────────────────────────
+r_job, r_job_id = poll_job("rjob")
+if r_job is not None and not r_job["applied"]:
+    cur = st.session_state.result
+    if cur and cur.get("id") == r_job["meta"].get("res_id"):
+        cur["video_path"] = r_job["result"]
+    r_job["applied"] = True
+    st.rerun()
