@@ -480,33 +480,37 @@ def process_upload(uploaded, opts, status, bar):
     title = os.path.splitext(uploaded.name)[0]
     status.write(f"**{title}** — {int(duration // 60)} خولەک")
 
-    with tempfile.TemporaryDirectory() as tmp:
-        bar.progress(0.06, text="خەریکی دەرهێنانی دەنگم...")
-        wav = os.path.join(tmp, "audio.wav")
-        r = subprocess.run(
-            ["ffmpeg", "-y", "-i", local_path, "-vn", "-ac", "1", "-ar", "16000", wav],
-            capture_output=True, text=True,
+    bar.progress(0.06, text="خەریکی دەرهێنانی دەنگم...")
+    # دەنگ ڕاستەوخۆ بە ffmpeg دەخوێنینەوە (بێ پێویستی بە av ی faster-whisper)
+    r = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", local_path, "-vn", "-ac", "1", "-ar", "16000", "-f", "f32le", "-"],
+        capture_output=True,
+    )
+    if r.returncode != 0 or not r.stdout:
+        raise RuntimeError(
+            "دەنگ لەم ڤیدیۆیە دەرنەهات. دڵنیابە فایلەکە دەنگی تێدایە.\n" + r.stderr.decode("utf-8", "ignore")[-300:]
         )
-        if r.returncode != 0 or not os.path.exists(wav):
-            raise RuntimeError("دەنگ لەم ڤیدیۆیە دەرنەهات. دڵنیابە فایلەکە دەنگی تێدایە.\n" + r.stderr[-300:])
+    import numpy as np
 
-        bar.progress(0.12, text="خەریکی گۆڕینی دەنگ بۆ دەقم (ئەمە کەمێک کات دەخایەنێت)...")
-        model = get_model(opts["whisper_model"])
-        segments, tinfo = model.transcribe(
-            wav,
-            language=opts["src_code"],
-            task="transcribe",
-            vad_filter=True,
-            beam_size=5,
-            condition_on_previous_text=False,
-        )
-        total = tinfo.duration or duration
-        rows = []
-        for seg in segments:
-            text = seg.text.strip()
-            if text:
-                rows.append({"start": seg.start, "end": seg.end, "original": text})
-            bar.progress(0.12 + 0.58 * min(seg.end / total, 1.0), text="خەریکی گۆڕینی دەنگ بۆ دەقم...")
+    audio = np.frombuffer(r.stdout, dtype=np.float32)
+
+    bar.progress(0.12, text="خەریکی گۆڕینی دەنگ بۆ دەقم (ئەمە کەمێک کات دەخایەنێت)...")
+    model = get_model(opts["whisper_model"])
+    segments, tinfo = model.transcribe(
+        audio,
+        language=opts["src_code"],
+        task="transcribe",
+        vad_filter=True,
+        beam_size=5,
+        condition_on_previous_text=False,
+    )
+    total = duration
+    rows = []
+    for seg in segments:
+        text = seg.text.strip()
+        if text:
+            rows.append({"start": seg.start, "end": seg.end, "original": text})
+        bar.progress(0.12 + 0.58 * min(seg.end / total, 1.0), text="خەریکی گۆڕینی دەنگ بۆ دەقم...")
     if not rows:
         raise RuntimeError("هیچ قسەیەک لە ڤیدیۆکەدا نەدۆزرایەوە.")
     status.write(f"زمانی دۆزراوە: {getattr(tinfo, 'language', '?')}")
