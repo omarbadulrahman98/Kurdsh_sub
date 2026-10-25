@@ -501,7 +501,7 @@ def process_upload(uploaded, opts, status, bar):
         language=opts["src_code"],
         task="transcribe",
         vad_filter=True,
-        beam_size=5,
+        beam_size=opts.get("beam_size", 5),
         condition_on_previous_text=False,
     )
     total = duration
@@ -773,6 +773,11 @@ with tab_up:
             type=["mp4", "mov", "mkv", "webm", "avi", "m4v"],
         )
         up_lang_label = st.selectbox("زمانی قسەکانی ڤیدیۆ", list(LANGS.keys()), index=len(LANGS) - 1)
+        up_speed = st.selectbox(
+            "خێرایی",
+            ["خێرا (کەمێک کەمتر وردە)", "وردتر (خاوتر)"],
+            index=0,
+        )
         go_up = st.form_submit_button("ژێرنووسی کوردی دروست بکە", type="primary", use_container_width=True)
 
 with tab_yt:
@@ -795,7 +800,8 @@ if go_up:
         api_key = get_api_key("") or secret("ANTHROPIC_API_KEY")
         uopts = {
             "src_code": LANGS[up_lang_label],
-            "whisper_model": DEFAULTS["whisper_model"],
+            "whisper_model": "base" if up_speed.startswith("خێرا") else DEFAULTS["whisper_model"],
+            "beam_size": 1 if up_speed.startswith("خێرا") else 5,
             "engine": "claude" if api_key else "google",
             "api_key": api_key,
             "max_minutes": DEFAULTS["max_minutes"],
