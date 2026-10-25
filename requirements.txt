@@ -4,5 +4,5 @@ deep-translator>=1.11.4
 anthropic>=0.40
 pandas
 
-# تەنها ئەگەر Whisper دەتەوێت (لەسەر VPS یان کۆمپیوتەری خۆت). هێمای # لابەرە:
-# faster-whisper>=1.0.3
+# Whisper بۆ ئەپلۆدی ڤیدیۆ پێویستە:
+faster-whisper>=1.0.3
