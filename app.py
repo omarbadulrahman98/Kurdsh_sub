@@ -150,7 +150,7 @@ def get_model(name: str):
 # ───────────────────────── وەرگێڕان ─────────────────────────
 
 
-TRANSLATE_STATS = {"failed": 0, "last_error": "", "ok": 0, "consecutive": 0}
+TRANSLATE_STATS = {"failed": 0, "last_error": "", "ok": 0, "consecutive": 0, "claude_error": "", "claude_fallback": 0}
 _TR_LOCK = threading.Lock()
 _CALL_POOL = ThreadPoolExecutor(max_workers=8)
 
@@ -304,11 +304,13 @@ def translate_claude(client, texts, title, src_code, glossary, on_progress):
                     if isinstance(val, str) and val.strip():
                         results[i] = val.strip()
                 break
-            except Exception:
+            except Exception as e:
+                TRANSLATE_STATS["claude_error"] = f"{type(e).__name__}: {e}"[:300]
                 time.sleep(2 * (attempt + 1))
         on_progress((c + 1) / total_chunks)
 
     missing = [i for i, r in enumerate(results) if r is None]
+    TRANSLATE_STATS["claude_fallback"] = len(missing)
     if missing:
         fallback = translate_google([texts[i] for i in missing], src_code)
         for i, t in zip(missing, fallback):
@@ -436,9 +438,21 @@ def transcribe_whisper(url, duration, opts, bar):
     return rows
 
 
+SORANI_CHARS = set("ەۆێڕڵ")
+
+
+def looks_sorani(lines):
+    """فارسی ئەم پیتانەی نییە (ە ۆ ێ ڕ ڵ)، بەڵام سۆرانی بە زۆری هەیەتی."""
+    cand = [t for t in lines if len(re.findall(r"[\u0600-\u06FF]", str(t))) >= 6]
+    if not cand:
+        return True
+    hits = sum(1 for t in cand if any(c in SORANI_CHARS for c in str(t)))
+    return hits / len(cand) >= 0.4
+
+
 def translate_rows(rows, title, opts, status, bar):
     texts = [r["original"] for r in rows]
-    TRANSLATE_STATS.update({"failed": 0, "last_error": "", "ok": 0, "consecutive": 0})
+    TRANSLATE_STATS.update({"failed": 0, "last_error": "", "ok": 0, "consecutive": 0, "claude_error": "", "claude_fallback": 0})
     glossary = parse_glossary(opts["glossary"])
     extra_fixes = {}
     bar.progress(0.72, text="خەریکی وەرگێڕانم بۆ کوردی سۆرانی...")
@@ -456,6 +470,12 @@ def translate_rows(rows, title, opts, status, bar):
         translated = translate_google(texts, opts["src_code"], on_progress)
         on_progress(1.0)
 
+    status.write("وەرگێڕان بە: " + ("Claude" if client else "گووگڵ"))
+    if client and TRANSLATE_STATS["claude_fallback"]:
+        status.write(
+            f"⚠️ Claude بۆ {TRANSLATE_STATS['claude_fallback']} دێڕ سەرکەوتوو نەبوو "
+            f"({TRANSLATE_STATS['claude_error'] or 'نەزانراو'})، گووگڵ بەکارهات."
+        )
     failed = TRANSLATE_STATS["failed"]
     if failed:
         err = TRANSLATE_STATS["last_error"] or "نەزانراو"
@@ -466,6 +486,16 @@ def translate_rows(rows, title, opts, status, bar):
                 f"هۆکار: {err}"
             )
         status.write(f"⚠️ {failed} دێڕ وەرنەگێڕدرا و بە زمانی ڕەسەن ماونەتەوە. هۆکار: {err}")
+
+    if not looks_sorani(translated):
+        raise RuntimeError(
+            "وەرگێڕانەکە کوردیی سۆرانی نییە (دەقەکە هێشتا فارسییە یان زمانی ڕەسەنە)، "
+            "بۆیە وەستام تا ڤیدیۆی فارسی دروست نەکەم.\n"
+            "وەرگێڕان بە: " + ("Claude" if client else "گووگڵ") + "\n"
+            + ("" if client else "ANTHROPIC_API_KEY لە Secrets دانەنراوە، بۆیە گووگڵ بەکارهات. "
+               "کلیلی Claude دابنێ.\n")
+            + (f"هۆکار: {TRANSLATE_STATS['claude_error'] or TRANSLATE_STATS['last_error'] or 'نەزانراو'}")
+        )
 
     for r, t in zip(rows, translated):
         r["kurdish"] = clean_ku(t, extra_fixes)
