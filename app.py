@@ -519,24 +519,32 @@ def probe_size(path: str):
     return int(w), int(h)
 
 
-def render_video(url, df, title_text, opts, bar):
+def render_video(url, df, title_text, opts, bar, upload=None):
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         raise RuntimeError("ffmpeg دانەمەزراوە. لە packages.txt یان بە apt install ffmpeg دایبمەزرێنە.")
 
     with tempfile.TemporaryDirectory() as tmp:
-        bar.progress(0.02, text="خەریکی داونلۆدکردنی ڤیدیۆم...")
-        dl_opts = {
-            **ydl_base_opts(opts["cookies_path"]),
-            "format": "bv*[height<=720]+ba/b[height<=720]/b",
-            "merge_output_format": "mkv",
-            "outtmpl": os.path.join(tmp, "video.%(ext)s"),
-        }
-        with yt_dlp.YoutubeDL(dl_opts) as ydl:
-            ydl.download([url])
-        files = [f for f in os.listdir(tmp) if f.startswith("video.") and not f.endswith((".part", ".ytdl"))]
-        if not files:
-            raise RuntimeError("داونلۆدکردنی ڤیدیۆ سەرکەوتوو نەبوو.")
-        src_path = os.path.join(tmp, files[0])
+        if upload is not None:
+            # ڤیدیۆی ئەپلۆدکراو: پێویست بە داونلۆد لە یوتوب نییە
+            bar.progress(0.02, text="خەریکی ئامادەکردنی ڤیدیۆی ئەپلۆدکراوم...")
+            ext = os.path.splitext(upload.name)[1].lower() or ".mp4"
+            src_path = os.path.join(tmp, "video" + ext)
+            with open(src_path, "wb") as f:
+                f.write(upload.getbuffer())
+        else:
+            bar.progress(0.02, text="خەریکی داونلۆدکردنی ڤیدیۆم...")
+            dl_opts = {
+                **ydl_base_opts(opts["cookies_path"]),
+                "format": "bv*[height<=720]+ba/b[height<=720]/b",
+                "merge_output_format": "mkv",
+                "outtmpl": os.path.join(tmp, "video.%(ext)s"),
+            }
+            with yt_dlp.YoutubeDL(dl_opts) as ydl:
+                ydl.download([url])
+            files = [f for f in os.listdir(tmp) if f.startswith("video.") and not f.endswith((".part", ".ytdl"))]
+            if not files:
+                raise RuntimeError("داونلۆدکردنی ڤیدیۆ سەرکەوتوو نەبوو.")
+            src_path = os.path.join(tmp, files[0])
 
         w, h = probe_size(src_path)
         duration = float(
@@ -740,6 +748,11 @@ if res:
         )
         st.caption("YouTube Studio ← Subtitles ← Add language ← Kurdish (Sorani) ← Upload file ← With timing")
 
+        uploaded_video = st.file_uploader(
+            "ئەگەر یوتوب ڕێگری کرد: ڤیدیۆکە خۆت ئەپلۆد بکە (ئارەزوومەندانە)",
+            type=["mp4", "mov", "mkv", "webm", "avi"],
+            key=f"up_{res['id']}_{res['rev']}",
+        )
         if st.button("دروستکردنی ڤیدیۆ بە ژێرنووسەوە", key=f"render_{res['id']}_{res['rev']}", use_container_width=True):
             cookies_path = cookies_from_secret()
             ropts = {
@@ -753,7 +766,7 @@ if res:
                 oldv = res.get("video_path")
                 if oldv and os.path.exists(oldv):
                     os.remove(oldv)
-                res["video_path"] = render_video(res["url"], edited, title_text, ropts, rbar)
+                res["video_path"] = render_video(res["url"], edited, title_text, ropts, rbar, upload=uploaded_video)
             except Exception as e:
                 st.error(friendly_error(e))
             finally:
