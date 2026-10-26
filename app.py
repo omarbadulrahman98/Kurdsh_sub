@@ -20,7 +20,8 @@ from deep_translator import GoogleTranslator
 
 st.set_page_config(page_title="ژێرنووسی کوردی", page_icon="🎬", layout="centered")
 
-CLAUDE_MODEL = "claude-sonnet-5-5"
+CLAUDE_MODEL = "claude-sonnet-5-5"   # وەرگێڕانی یەکەم
+POLISH_MODEL = "claude-opus-5-5"      # پێداچوونەوەی کۆتایی (باشترین کوالیتی)
 CHUNK_SIZE = 30          # ژمارەی دێڕەکان لە هەر داواکارییەکی Claude
 MAX_VIDEOS = 10          # زۆرترین ژمارەی ڤیدیۆ لە یەک جار
 LINE_WIDTH = 42          # درێژی دێڕی ژێرنووس
@@ -76,7 +77,17 @@ def format_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+INVISIBLE_RE = re.compile("[\u200b\u200c\u200d\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff\u061c\u00ad]")
+
+
+def strip_invisible(text: str) -> str:
+    """نیشانە نەبینراوەکان (ZWNJ و هتد) لە فۆنتەکەدا وەک چوارگۆشە دەردەکەون؛ لایان دەبەین."""
+    text = str(text).replace("ه\u200c", "ە")  # «ه‌» ی کیبۆردی فارسی بۆ ە
+    return INVISIBLE_RE.sub("", text)
+
+
 def clean_ku(text: str, extra_fixes: dict) -> str:
+    text = strip_invisible(text)
     text = (
         text.replace("ي", "ی")
         .replace("ك", "ک")
@@ -150,7 +161,7 @@ def get_model(name: str):
 # ───────────────────────── وەرگێڕان ─────────────────────────
 
 
-TRANSLATE_STATS = {"failed": 0, "last_error": "", "ok": 0, "consecutive": 0, "claude_error": "", "claude_fallback": 0}
+TRANSLATE_STATS = {"failed": 0, "last_error": "", "ok": 0, "consecutive": 0, "claude_error": "", "claude_fallback": 0, "refine_error": "", "refine_failed_chunks": 0}
 _TR_LOCK = threading.Lock()
 _CALL_POOL = ThreadPoolExecutor(max_workers=8)
 
@@ -255,13 +266,39 @@ def translate_google(texts, src_code, on_progress=None):
     return results
 
 
+STYLE_GUIDE = (
+    "QUALITY TARGET: broadcast-quality, professional subtitles in pure, elegant standard Central Kurdish "
+    "(Sorani, Arabic script). The viewer must feel the text was written by a skilled native Sorani writer.\n"
+    "1. VOCABULARY: 100% of the words must be Sorani. No Persian, Arabic, Turkish or English words may remain, "
+    "except proper names, which you transliterate into Sorani letters. Whenever a natural native Kurdish word exists, "
+    "use it instead of a Persian/Arabic loanword (examples: دوژمن not دشمن, شەڕ not جنگ, ساڵ not سال, مێژوو not تاریخ, "
+    "خەڵک not مردم, وڵات not کشور, پاشا not شاه/پادشاه, سوپا not ارتش, شار not شهر, هێز not قدرت, ئێران not ایران). "
+    "Keep a loanword only if it is fully established in everyday Sorani and has no natural native equivalent.\n"
+    "2. GRAMMAR: correct Sorani morphology and syntax: verb conjugation (دەـ present prefix, personal endings, "
+    "negation نـ/نا, past and perfect forms), the ezafe (ی), definite suffix (ەکە), plural (ەکان), pronominal suffixes, "
+    "natural word order with the verb at the end, consistent tense and person.\n"
+    "3. ORTHOGRAPHY: use ە ۆ ێ ڕ ڵ ڤ گ پ چ ژ correctly; ئ before word-initial vowels; never use Persian/Arabic letters "
+    "ك ي ى ة ؤ أ إ آ or the Persian ه where Sorani uses ە; no zero-width characters; Kurdish punctuation (، ؟ ؛).\n"
+    "4. STYLE: translate the meaning, not word by word. Natural spoken narration, dignified and clear, "
+    "short subtitle lines readable in 2 to 3 seconds. Keep numbers. Transliterate each name the same way in every line.\n"
+)
+
 SYSTEM_PROMPT = (
-    "You are a professional subtitle translator into Central Kurdish (Sorani), written in Arabic script. "
-    "Rules: translate the meaning naturally as spoken language, in short subtitle style. "
-    "Use correct Sorani orthography (ێ ۆ ڕ ڵ ە). Write Iran as ئێران and the preposition 'in' as لە. "
-    "Transliterate personal names and places into Sorani script. Keep numbers. "
-    "Do not merge, split, add or drop lines. Do not explain anything. "
-    "Output only a JSON object."
+    "You are a professional subtitle translator into Central Kurdish (Sorani), written in Arabic script.\n"
+    + STYLE_GUIDE
+    + "Do not merge, split, add or drop lines. Do not explain anything. Output only a JSON object."
+)
+
+REFINE_PROMPT = (
+    "You are a senior Central Kurdish (Sorani) language editor and proofreader.\n"
+    "For each id you receive the source text, a draft Kurdish translation and sometimes a list of issues found in it. "
+    "Return the final corrected Kurdish line. Compare with the source and fix any mistranslation; fix grammar, "
+    "spelling and orthography; replace EVERY non-Sorani word (Persian, Arabic, Turkish, English) with a natural Sorani "
+    "word; improve flow and naturalness without changing the meaning; keep it short enough for a subtitle. "
+    "If the draft is already perfect, return it unchanged.\n"
+    + STYLE_GUIDE
+    + "Return a JSON object with exactly the same keys, each value being the final Kurdish string. "
+    "Do not explain anything. Output only the JSON object."
 )
 
 
@@ -271,6 +308,65 @@ def parse_json_object(raw: str) -> dict:
     if start == -1 or end == -1:
         raise ValueError("no JSON object")
     return json.loads(raw[start : end + 1])
+
+
+def claude_models():
+    """مۆدێلی وەرگێڕان و مۆدێلی پێداچوونەوە (دەتوانرێت لە Secrets بگۆڕدرێن)."""
+    translate_model = secret("CLAUDE_MODEL") or CLAUDE_MODEL
+    polish_model = secret("POLISH_MODEL") or POLISH_MODEL
+    return translate_model, polish_model
+
+
+def refine_claude(client, texts, drafts, title, src_code, glossary, on_progress, issues=None):
+    """پێداچوونەوەی دووەم: گرامەر، ڕێنووس، لابردنی وشەی نا-سۆرانی. ئەگەر شکستی هێنا، دەقی پێشوو دەگەڕێنێتەوە."""
+    results = list(drafts)
+    translate_model, polish_model = claude_models()
+    models = [polish_model] + ([translate_model] if translate_model != polish_model else [])
+    gloss_text = "\n".join(f"{a} = {b}" for a, b in glossary)
+    total_chunks = max(1, (len(texts) + CHUNK_SIZE - 1) // CHUNK_SIZE)
+
+    for c, start in enumerate(range(0, len(texts), CHUNK_SIZE)):
+        idx = list(range(start, min(start + CHUNK_SIZE, len(texts))))
+        payload = {}
+        for i in idx:
+            item = {"source": texts[i], "draft": drafts[i]}
+            if issues and i in issues:
+                item["issues"] = issues[i]
+            payload[str(i)] = item
+        prompt = (
+            f"Video title (context): {title}\n"
+            f"Source language: {LANG_NAMES.get(src_code, 'the source language')}\n"
+            + (f"Glossary (always use these translations):\n{gloss_text}\n" if gloss_text else "")
+            + "\nEdit and finalize every item of this JSON object.\n\n"
+            + json.dumps(payload, ensure_ascii=False)
+        )
+        done = False
+        for model in models:
+            for attempt in range(2):
+                try:
+                    msg = client.messages.create(
+                        model=model,
+                        max_tokens=8000,
+                        system=REFINE_PROMPT,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
+                    raw = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+                    data = parse_json_object(raw)
+                    for i in idx:
+                        val = data.get(str(i))
+                        if isinstance(val, str) and val.strip() and re.search(r"[\u0600-\u06FF0-9]", val):
+                            results[i] = val.strip()
+                    done = True
+                    break
+                except Exception as e:
+                    TRANSLATE_STATS["refine_error"] = f"{type(e).__name__}: {e}"[:300]
+                    time.sleep(2)
+            if done:
+                break
+        if not done:
+            TRANSLATE_STATS["refine_failed_chunks"] += 1
+        on_progress((c + 1) / total_chunks)
+    return results
 
 
 def translate_claude(client, texts, title, src_code, glossary, on_progress):
@@ -292,7 +388,7 @@ def translate_claude(client, texts, title, src_code, glossary, on_progress):
         for attempt in range(3):
             try:
                 msg = client.messages.create(
-                    model=CLAUDE_MODEL,
+                    model=claude_models()[0],
                     max_tokens=8000,
                     system=SYSTEM_PROMPT,
                     messages=[{"role": "user", "content": prompt}],
@@ -450,9 +546,52 @@ def looks_sorani(lines):
     return hits / len(cand) >= 0.4
 
 
+def _norm_text(t):
+    return " ".join(strip_invisible(t).split())
+
+
+def find_untranslated(texts, translated):
+    """دێڕەکانی کە هێشتا فارسی/ڕەسەنن (وەک خۆی ماونەتەوە یان پیتی سۆرانییان نییە)."""
+    bad = []
+    for i, (o, t) in enumerate(zip(texts, translated)):
+        t = str(t)
+        if len(re.findall(r"[\u0600-\u06FF]", t)) < 8:
+            continue
+        if _norm_text(o) == _norm_text(t) or not any(c in SORANI_CHARS for c in t):
+            bad.append(i)
+    return bad
+
+
+PERSIAN_ONLY_CHARS = set("آأإؤةٱ")
+PERSIAN_WORDS = {
+    "است", "هستند", "هستم", "هستی", "بودند", "برای", "اینکه", "ولی", "اما", "نمی", "نمیشود", "آنها",
+    "های", "کنند", "کردند", "شد", "شده", "شدند", "میشود", "می", "را", "هم", "هر", "یک", "که", "این",
+    "از", "به", "در",
+}
+
+
+def non_sorani_tokens(text):
+    toks = re.findall(r"[\u0600-\u06FF]+", strip_invisible(text))
+    return [t for t in toks if t in PERSIAN_WORDS or any(c in PERSIAN_ONLY_CHARS for c in t)]
+
+
+def find_problems(texts, translated):
+    """{ژمارەی دێڕ: [کێشەکان]} بۆ دێڕە وەرنەگێڕدراو یان خاوەن وشەی نا-سۆرانی."""
+    problems = {}
+    for i in find_untranslated(texts, translated):
+        problems[i] = ["this line is still in the source language; translate it fully"]
+    for i, t in enumerate(translated):
+        bad = non_sorani_tokens(t)
+        if bad:
+            problems.setdefault(i, []).append(
+                "contains non-Sorani words: " + ", ".join(sorted(set(bad))[:8]) + "; replace them with Sorani"
+            )
+    return problems
+
+
 def translate_rows(rows, title, opts, status, bar):
     texts = [r["original"] for r in rows]
-    TRANSLATE_STATS.update({"failed": 0, "last_error": "", "ok": 0, "consecutive": 0, "claude_error": "", "claude_fallback": 0})
+    TRANSLATE_STATS.update({"failed": 0, "last_error": "", "ok": 0, "consecutive": 0, "claude_error": "", "claude_fallback": 0, "refine_error": "", "refine_failed_chunks": 0})
     glossary = parse_glossary(opts["glossary"])
     extra_fixes = {}
     bar.progress(0.72, text="خەریکی وەرگێڕانم بۆ کوردی سۆرانی...")
@@ -465,7 +604,13 @@ def translate_rows(rows, title, opts, status, bar):
         import anthropic
 
         client = anthropic.Anthropic(api_key=opts["api_key"])
-        translated = translate_claude(client, texts, title, opts["src_code"], glossary, on_progress)
+        translated = translate_claude(
+            client, texts, title, opts["src_code"], glossary, lambda f: on_progress(0.5 * f)
+        )
+        bar.progress(0.85, text="خەریکی پێداچوونەوەی کوردییەکەم (گرامەر و ڕێنووس)...")
+        translated = refine_claude(
+            client, texts, translated, title, opts["src_code"], glossary, lambda f: on_progress(0.5 + 0.5 * f)
+        )
     else:
         translated = translate_google(texts, opts["src_code"], on_progress)
         on_progress(1.0)
@@ -487,6 +632,32 @@ def translate_rows(rows, title, opts, status, bar):
             )
         status.write(f"⚠️ {failed} دێڕ وەرنەگێڕدرا و بە زمانی ڕەسەن ماونەتەوە. هۆکار: {err}")
 
+    if client:
+        if TRANSLATE_STATS["refine_failed_chunks"]:
+            status.write(
+                f"⚠️ پێداچوونەوەی کۆتایی بۆ {TRANSLATE_STATS['refine_failed_chunks']} بەش سەرکەوتوو نەبوو "
+                f"({TRANSLATE_STATS['refine_error'] or 'نەزانراو'}). وەرگێڕانی یەکەم بەکارهات."
+            )
+        for _ in range(2):
+            problems = find_problems(texts, translated)
+            if not problems:
+                break
+            idx = sorted(problems)
+            status.write(f"خەریکی چاککردنەوەی {len(idx)} دێڕم کە وشەی فارسی یان نا-سۆرانییان تێدایە...")
+            fixed = refine_claude(
+                client, [texts[i] for i in idx], [translated[i] for i in idx], title, opts["src_code"], glossary,
+                lambda f: None, issues={k: problems[i] for k, i in enumerate(idx)},
+            )
+            for i, t in zip(idx, fixed):
+                translated[i] = t
+    left = sorted(find_problems(texts, translated))
+    if left:
+        times = ", ".join(f"{int(rows[i]['start'] // 60)}:{int(rows[i]['start'] % 60):02d}" for i in left[:12])
+        status.write(
+            f"⚠️ {len(left)} دێڕ هێشتا وشەی فارسی یان نا-سۆرانییان تێدایە (لە خولەکی: {times}). "
+            "لە «دەستکاریکردنی دەق» ڕاستیان بکەرەوە پێش دروستکردنی ڤیدیۆ."
+        )
+
     if not looks_sorani(translated):
         raise RuntimeError(
             "وەرگێڕانەکە کوردیی سۆرانی نییە (دەقەکە هێشتا فارسییە یان زمانی ڕەسەنە)، "
@@ -503,7 +674,8 @@ def translate_rows(rows, title, opts, status, bar):
     ku_title = ""
     try:
         if client:
-            ku_title = translate_claude(client, [title], title, opts["src_code"], glossary, lambda f: None)[0]
+            ku_title = translate_claude(client, [title], title, opts["src_code"], glossary, lambda f: None)
+            ku_title = refine_claude(client, [title], ku_title, title, opts["src_code"], glossary, lambda f: None)[0]
         else:
             ku_title = translate_google([title], opts["src_code"])[0]
         ku_title = clean_ku(ku_title, extra_fixes)
@@ -714,6 +886,7 @@ def format_ass_time(seconds: float) -> str:
 
 
 def ass_escape(text: str) -> str:
+    text = strip_invisible(text)
     text = text.replace("{", "(").replace("}", ")").replace("\\", "/")
     text = " ".join(text.split("\n")).strip()
     # ئاراستەی ڕاستەچەپ بۆ libass (خاڵ و نیشانەکان لە لای چەپ بن)
