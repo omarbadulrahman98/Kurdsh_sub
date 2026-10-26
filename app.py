@@ -136,16 +136,21 @@ def parse_glossary(text: str):
     return pairs
 
 
+def clean_key(key) -> str:
+    """بۆشایی، دێڕی نوێ و کەوانە لە کلیلەکە دەسڕێتەوە (هۆکاری باوی 401)."""
+    return re.sub(r"\s+", "", str(key or "")).strip("\"'")
+
+
 def get_api_key(manual: str) -> str:
     if manual.strip():
-        return manual.strip()
+        return clean_key(manual)
     try:
         key = st.secrets["ANTHROPIC_API_KEY"]
         if key:
-            return str(key)
+            return clean_key(key)
     except Exception:
         pass
-    return os.environ.get("ANTHROPIC_API_KEY", "")
+    return clean_key(os.environ.get("ANTHROPIC_API_KEY", ""))
 
 
 def whisper_available() -> bool:
@@ -311,6 +316,27 @@ def parse_json_object(raw: str) -> dict:
     return json.loads(raw[start : end + 1])
 
 
+def is_auth_error(e) -> bool:
+    return getattr(e, "status_code", None) in (401, 403) or type(e).__name__ in (
+        "AuthenticationError", "PermissionDeniedError",
+    )
+
+
+def check_claude_key(client):
+    """پشکنینی خێرای کلیل (یەک داواکاریی زۆر بچووک). (دروستە؟، هۆکار) دەگەڕێنێتەوە."""
+    try:
+        client.messages.create(
+            model=claude_models()[0], max_tokens=1, messages=[{"role": "user", "content": "hi"}]
+        )
+        return True, ""
+    except Exception as e:
+        if is_auth_error(e):
+            return False, "کلیلەکە هەڵەیە یان هەڵوەشێنراوەتەوە (401)"
+        if getattr(e, "status_code", None) == 404:
+            return False, "مۆدێلەکە بۆ ئەم کلیلە بەردەست نییە"
+        return True, ""  # هەڵەی کاتی (سنوور، قەرەباڵغی)؛ دەستپێدەکەین
+
+
 def claude_models():
     """مۆدێلی وەرگێڕان و مۆدێلی پێداچوونەوە (دەتوانرێت لە Secrets بگۆڕدرێن)."""
     translate_model = secret("CLAUDE_MODEL") or CLAUDE_MODEL
@@ -349,7 +375,6 @@ def refine_claude(client, texts, drafts, title, src_code, glossary, on_progress,
                 try:
                     msg = client.messages.create(
                         model=model,
-                        timeout=90.0,
                         max_tokens=8000,
                         system=REFINE_PROMPT,
                         messages=[{"role": "user", "content": prompt}],
@@ -364,6 +389,8 @@ def refine_claude(client, texts, drafts, title, src_code, glossary, on_progress,
                     break
                 except Exception as e:
                     TRANSLATE_STATS["refine_error"] = f"{type(e).__name__}: {e}"[:300]
+                    if is_auth_error(e):
+                        break
                     time.sleep(2)
             if done:
                 break
@@ -403,7 +430,6 @@ def translate_claude(client, texts, title, src_code, glossary, on_progress):
             try:
                 msg = client.messages.create(
                     model=model,
-                    timeout=90.0,
                     max_tokens=8000,
                     system=SYSTEM_PROMPT,
                     messages=[{"role": "user", "content": prompt}],
@@ -417,6 +443,8 @@ def translate_claude(client, texts, title, src_code, glossary, on_progress):
                 break
             except Exception as e:
                 TRANSLATE_STATS["claude_error"] = f"{type(e).__name__}: {e}"[:300]
+                if is_auth_error(e):
+                    break
                 time.sleep(2 * (attempt + 1))
         with _TR_LOCK:
             progress["done"] += 1
@@ -576,14 +604,10 @@ def find_untranslated(texts, translated):
     """دێڕەکانی کە هێشتا فارسی/ڕەسەنن (وەک خۆی ماونەتەوە یان پیتی سۆرانییان نییە)."""
     bad = []
     for i, (o, t) in enumerate(zip(texts, translated)):
-        o, t = str(o), str(t)
-        norm_o, norm_t = _norm_text(o), _norm_text(t)
-        # Ignore empty, punctuation-only, and number-only captions.
-        has_letters = bool(re.search(r"[A-Za-z\\u0600-\\u06FF]", norm_o))
-        if not norm_t or not has_letters:
+        t = str(t)
+        if len(re.findall(r"[\u0600-\u06FF]", t)) < 8:
             continue
-        # Do not skip short captions: short unchanged phrases are often missed.
-        if norm_o == norm_t or not any(c in SORANI_CHARS for c in t):
+        if _norm_text(o) == _norm_text(t) or not any(c in SORANI_CHARS for c in t):
             bad.append(i)
     return bad
 
@@ -629,7 +653,15 @@ def translate_rows(rows, title, opts, status, bar):
     if opts["engine"] == "claude" and opts["api_key"]:
         import anthropic
 
-        client = anthropic.Anthropic(api_key=opts["api_key"], timeout=90.0, max_retries=2)
+        client = anthropic.Anthropic(api_key=opts["api_key"])
+        key_ok, key_why = check_claude_key(client)
+        if not key_ok:
+            status.write(
+                f"⚠️ کلیلی Claude کار ناکات: {key_why}. بۆیە گووگڵ بەکاردێت (کوالیتی کەمتر). "
+                "کلیلێکی نوێ لە console.anthropic.com دروست بکە و لە Secrets دایبنێ."
+            )
+            client = None
+    if client:
         scale = 0.5 if opts.get("refine_all", True) else 1.0
         translated = translate_claude(
             client, texts, title, opts["src_code"], glossary, lambda f: on_progress(scale * f)
@@ -643,7 +675,8 @@ def translate_rows(rows, title, opts, status, bar):
         translated = translate_google(texts, opts["src_code"], on_progress)
         on_progress(1.0)
 
-    status.write("وەرگێڕان بە: " + ("Claude" if client else "گووگڵ"))
+    TRANSLATE_STATS["engine"] = "Claude" if client else "گووگڵ"
+    status.write("وەرگێڕان بە: " + TRANSLATE_STATS["engine"])
     if client and TRANSLATE_STATS["claude_fallback"]:
         status.write(
             f"⚠️ Claude بۆ {TRANSLATE_STATS['claude_fallback']} دێڕ سەرکەوتوو نەبوو "
@@ -758,6 +791,7 @@ def process_video(url, opts, status, bar):
     return {
         "id": vid, "url": url, "title": title, "ku_title": ku_title,
         "duration": int(duration), "df": df, "rev": int(time.time()),
+        "engine": TRANSLATE_STATS.get("engine", ""),
     }
 
 
@@ -886,6 +920,7 @@ def process_upload(uploaded, opts, status, bar):
     return {
         "id": vid, "url": "", "local_path": local_path, "title": title, "ku_title": ku_title,
         "duration": int(duration), "df": df, "rev": int(time.time()),
+        "engine": TRANSLATE_STATS.get("engine", ""),
     }
 
 
@@ -921,7 +956,67 @@ def ass_escape(text: str) -> str:
     return "\u202b" + text + "\u202c"
 
 
-def build_ass(df, title_text, font, cw, ch, vertical, video_top, video_bottom, total_seconds) -> str:
+KU_FONT_PRIORITY = ["Vazirmatn", "Noto Naskh Arabic", "Noto Kufi Arabic", "Amiri", "Scheherazade New", "Noto Sans Arabic"]
+FONT_SAMPLE_TEXT = "بنەماڵەی حوسێن لە ئەسفەهان"
+
+
+@st.cache_resource(show_spinner=False)
+def kurdish_fonts():
+    """ئەو فۆنتانەی لەسەر سێرڤەر دامەزراون و هەموو پیتە کوردییەکانیان هەیە (ە ێ ۆ ڕ ڵ)."""
+    fams = []
+    try:
+        out = subprocess.run(
+            ["fc-list", ":charset=6d5 6ce 6c6 695 6b5", "family"], capture_output=True, text=True, timeout=20
+        ).stdout
+        for line in out.splitlines():
+            name = line.split(",")[0].strip()
+            if name and name not in fams:
+                fams.append(name)
+    except Exception:
+        pass
+    fams = [f for f in fams if not any(b in f.lower() for b in ("mono", "emoji", "symbol", "unifont"))]
+    ordered = [f for f in KU_FONT_PRIORITY if f in fams] + [f for f in sorted(fams) if f not in KU_FONT_PRIORITY]
+    return ordered or [DEFAULTS["font"]]
+
+
+def render_font_sample(font: str) -> bytes:
+    """وێنەیەکی نموونە: سەرەوە ئەستوور، خوارەوە ئاسایی، بە هەمان ffmpeg/libass ی ڤیدیۆ."""
+    text = ass_escape(FONT_SAMPLE_TEXT)
+    ass = "\n".join([
+        "[Script Info]", "ScriptType: v4.00+", "PlayResX: 720", "PlayResY: 300", "WrapStyle: 0",
+        "ScaledBorderAndShadow: yes", "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding",
+        f"Style: B,{font},44,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,2,0,8,20,20,25,1",
+        f"Style: R,{font},44,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,2,0,2,20,20,25,1",
+        "", "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+        f"Dialogue: 0,0:00:00.00,0:00:05.00,B,,0,0,0,,{text}",
+        f"Dialogue: 0,0:00:00.00,0:00:05.00,R,,0,0,0,,{text}",
+    ])
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "sample.ass"), "w", encoding="utf-8") as f:
+            f.write(ass)
+        fonts_opt = ""
+        if os.path.isdir(FONTS_DIR) and os.listdir(FONTS_DIR):
+            shutil.copytree(FONTS_DIR, os.path.join(tmp, "fonts"))
+            fonts_opt = ":fontsdir=fonts"
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=720x300:d=1",
+             "-vf", f"subtitles=sample.ass{fonts_opt}", "-frames:v", "1", "out.png"],
+            cwd=tmp, capture_output=True, text=True, timeout=90,
+        )
+        out = os.path.join(tmp, "out.png")
+        if r.returncode != 0 or not os.path.exists(out):
+            raise RuntimeError(r.stderr[-300:] or "ffmpeg سەرکەوتوو نەبوو")
+        with open(out, "rb") as f:
+            return f.read()
+
+
+def build_ass(df, title_text, font, cw, ch, vertical, video_top, video_bottom, total_seconds, bold=True) -> str:
+    bflag = -1 if bold else 0
     if vertical:
         sub_size = int(cw * 0.061)
         sub_align = 8                       # لە سەرەوەی ناوچەی ژێرەوە دەست پێدەکات
@@ -949,8 +1044,8 @@ def build_ass(df, title_text, font, cw, ch, vertical, video_top, video_bottom, t
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding",
-        f"Style: Sub,{font},{sub_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,{outline},0,{sub_align},{side},{side},{sub_margin_v},1",
-        f"Style: Title,{font},{title_size},&H0000FFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,{outline},0,8,{side},{side},{title_margin_v},1",
+        f"Style: Sub,{font},{sub_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,{bflag},0,0,0,100,100,0,0,1,{outline},0,{sub_align},{side},{side},{sub_margin_v},1",
+        f"Style: Title,{font},{title_size},&H0000FFFF,&H0000FFFF,&H00000000,&H80000000,{bflag},0,0,0,100,100,0,0,1,{outline},0,8,{side},{side},{title_margin_v},1",
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
@@ -1036,7 +1131,7 @@ def render_video(url, df, title_text, opts, bar, upload=None, local_path=None):
             top, bottom = 0, ch
             base_vf = f"scale={cw}:{ch},setsar=1"
 
-        ass = build_ass(df, title_text, opts["font"], cw, ch, vertical, top, bottom, duration)
+        ass = build_ass(df, title_text, opts["font"], cw, ch, vertical, top, bottom, duration, bold=opts.get("bold", True))
         with open(os.path.join(tmp, "subs.ass"), "w", encoding="utf-8") as f:
             f.write(ass)
 
@@ -1230,24 +1325,25 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-with st.expander("⚙️ ڕێکخستنی کوالیتیی وەرگێڕان (ئارەزوومەندانە)"):
+with st.expander("نموونەی شێوەی پیتەکان لە ڤیدیۆدا (فۆنت)"):
     st.caption(
-        "بۆ کوالیتیی باشتر، کلیلی Claude دابنێ؛ ئەگەر کلیلی Claude نەبێت، ئەپەکە گووگڵ بەکاردەهێنێت. "
-        "کلیلەکە لە کۆدەکەدا هەڵناگیرێت و تەنها بۆ ئەم سێشنە بەکاردەهێنرێت."
+        "ئەگەر پیتەکان لە ڤیدیۆدا شێواون یان بە یەکەوە نەبەسترابوون، ئێرە نموونەی هەر فۆنتێک ببینە "
+        "(سەرەوە: ئەستوور، خوارەوە: ئاسایی) و باشترینیان لە خوارەوە هەڵبژێرە."
     )
-    st.text_input(
-        "Claude API key",
-        type="password",
-        key="manual_api_key",
-        help="یان ANTHROPIC_API_KEY لە Secrets/environment دابنێ.",
-    )
-    st.text_area(
-        "فەرهەنگی تایبەت (هەر دێڕێک: وشەی سەرچاوە = وشەی سۆرانی)",
-        key="translation_glossary",
-        height=90,
-        placeholder="دشمن = دوژمن\\nشاه = پاشا",
-        help="بۆ ناوەکان و وشە تایبەتەکان بەکاردێت تا وەرگێڕان یەکدەست بێت.",
-    )
+    if st.button("پیشاندانی نموونەی فۆنتەکان", key="font_preview_btn"):
+        samples = []
+        for fam in kurdish_fonts()[:8]:
+            try:
+                samples.append((fam, render_font_sample(fam)))
+            except Exception as e:
+                samples.append((fam, f"{type(e).__name__}: {e}"[:300]))
+        st.session_state.font_samples = samples
+    for fam, img in st.session_state.get("font_samples", []):
+        st.markdown(f"**{fam}**")
+        if isinstance(img, bytes):
+            st.image(img)
+        else:
+            st.warning(img)
 
 tab_up, tab_yt = st.tabs(["ئەپلۆدی ڤیدیۆ (بێ یوتوب)", "لینکی یوتوب"])
 
@@ -1260,9 +1356,11 @@ with tab_up:
         up_lang_label = st.selectbox("زمانی قسەکانی ڤیدیۆ", list(LANGS.keys()), index=len(LANGS) - 1)
         up_speed = st.selectbox(
             "خێرایی",
-            ["خێرا + چاککردنەوەی دێڕە گومانلێکراوەکان", "وردتر (پێداچوونەوەی تەواوی Opus، خاوتر)"],
+            ["خێرا (وەرگێڕانی یەک قۆناغ)", "وردتر (پێداچوونەوەی Opus، خاوتر)"],
             index=0,
         )
+        up_font = st.selectbox("فۆنتی ژێرنووس", kurdish_fonts())
+        up_bold = st.checkbox("پیتی ئەستوور (Bold)", value=True)
         up_auto = st.checkbox("دوای ژێرنووس، ڤیدیۆکەش خۆکارانە دروست بکە", value=True)
         go_up = st.form_submit_button("ژێرنووسی کوردی دروست بکە", type="primary", use_container_width=True)
 
@@ -1285,21 +1383,23 @@ if go_up:
         st.session_state.result = None
         st.session_state.pop("loaded_job", None)
         st.query_params.pop("rjob", None)
-        api_key = get_api_key(st.session_state.get("manual_api_key", "")) or secret("ANTHROPIC_API_KEY")
+        api_key = get_api_key("")
         fast = up_speed.startswith("خێرا")
         uopts = {
             "src_code": LANGS[up_lang_label],
             "whisper_model": "base" if fast else DEFAULTS["whisper_model"],
             "beam_size": 1 if fast else 5,
             "refine_all": not fast,
-            "groq_key": secret("GROQ_API_KEY"),
+            "groq_key": clean_key(secret("GROQ_API_KEY")),
             "engine": "claude" if api_key else "google",
             "api_key": api_key,
             "max_minutes": DEFAULTS["max_minutes"],
-            "glossary": st.session_state.get("translation_glossary", ""),
+            "glossary": "",
         }
         up_obj = UploadedBytes(up_file.name, up_file.getvalue())
-        auto_info = {"auto_render": bool(up_auto), "fast": fast}
+        st.session_state.font_choice = up_font
+        st.session_state.bold_choice = bool(up_bold)
+        auto_info = {"auto_render": bool(up_auto), "fast": fast, "font": up_font, "bold": bool(up_bold)}
         jid = start_job(lambda rep: process_upload(up_obj, uopts, rep, rep), meta=auto_info)
         st.query_params["job"] = jid
         st.rerun()
@@ -1315,7 +1415,8 @@ if up_job is not None and up_job["meta"].get("auto_render") and not up_job.get("
     ropts0 = {
         "layout": DEFAULTS["layout"],
         "canvas_w": DEFAULTS["canvas_w"],
-        "font": DEFAULTS["font"],
+        "font": up_job["meta"].get("font", DEFAULTS["font"]),
+        "bold": up_job["meta"].get("bold", True),
         "cookies_path": None,
         "preset": "ultrafast" if fast0 else "veryfast",
         "crf": 26 if fast0 else 23,
@@ -1342,7 +1443,7 @@ if go:
         st.query_params.pop("job", None)
         st.query_params.pop("rjob", None)
 
-        api_key = get_api_key(st.session_state.get("manual_api_key", "")) or secret("ANTHROPIC_API_KEY")
+        api_key = get_api_key("")
         cookies_path = cookies_from_secret()
         opts = {
             "src_code": None,                      # زمان خۆکار دیاری دەکرێت
@@ -1352,7 +1453,7 @@ if go:
             "engine": "claude" if api_key else "google",
             "api_key": api_key,
             "max_minutes": DEFAULTS["max_minutes"],
-            "glossary": st.session_state.get("translation_glossary", ""),
+            "glossary": "",
             "cookies_path": cookies_path,
         }
         with st.status("خەریکی دروستکردنی ژێرنووسم...", expanded=True) as status:
@@ -1372,6 +1473,57 @@ res = st.session_state.result
 if res:
     st.subheader(res["title"])
     dl_box = st.container()
+
+    # ڕاپۆرتی کوالیتی + چاککردنەوە بە Claude
+    _texts = res["df"]["original"].tolist()
+    _ku = res["df"]["kurdish"].tolist()
+    _probs = find_problems(_texts, _ku)
+    _engine = res.get("engine") or "نەزانراو"
+    if _engine == "Claude":
+        st.caption(f"وەرگێڕان بە: Claude | دێڕی کێشەدار: {len(_probs)} لە {len(_ku)}")
+    else:
+        st.warning(
+            f"وەرگێڕان بە: {_engine}. Claude بەکارنەهاتووە، بۆیە کوالیتی نزمترە. "
+            "ANTHROPIC_API_KEY ی دروست لە Secrets دابنێ و دووبارە دروستی بکەرەوە."
+        )
+    with st.expander("چاککردنەوەی کوردی بە Claude (وشە فارسییەکان، گرامەر)"):
+        st.caption(
+            f"{len(_probs)} دێڕ هێشتا وشەی فارسی یان نا-سۆرانییان تێدایە." if _probs
+            else "هیچ دێڕێکی دیار نییە کە وشەی فارسییان تێدا بێت."
+        )
+        fix_mode = st.radio(
+            "کام دێڕەکان؟",
+            ["تەنها دێڕە کێشەدارەکان", "هەموو دێڕەکان (پێداچوونەوەی تەواو بە Opus)"],
+            key=f"fixmode_{res['id']}",
+        )
+        if st.button("چاککردنەوە", key=f"fix_{res['id']}_{res['rev']}", use_container_width=True):
+            _key = get_api_key("")
+            if not _key:
+                st.error("ANTHROPIC_API_KEY لە Secrets دانەنراوە.")
+            else:
+                import anthropic
+
+                _client = anthropic.Anthropic(api_key=_key)
+                _ok, _why = check_claude_key(_client)
+                if not _ok:
+                    st.error(f"کلیلی Claude کار ناکات: {_why}")
+                else:
+                    _idx = sorted(_probs) if fix_mode.startswith("تەنها") else list(range(len(_ku)))
+                    if not _idx:
+                        st.info("دێڕێک نییە بۆ چاککردن.")
+                    else:
+                        with st.spinner(f"خەریکی چاککردنی {len(_idx)} دێڕم..."):
+                            _issues = {k: _probs[i] for k, i in enumerate(_idx) if i in _probs}
+                            _fixed = refine_claude(
+                                _client, [_texts[i] for i in _idx], [_ku[i] for i in _idx],
+                                res["title"], None, [], lambda f: None, issues=_issues,
+                            )
+                            _df = res["df"].copy()
+                            for i, t in zip(_idx, _fixed):
+                                _df.at[i, "kurdish"] = clean_ku(t, {})
+                            res["df"] = _df
+                            res["rev"] += 1
+                        st.rerun()
 
     with st.expander("دەستکاریکردنی دەق و سەرناو"):
         st.caption("ئەگەر وشەیەک هەڵە بوو، لێرە ڕاستی بکەرەوە. فایلەکان بە دەستکارییەکەتەوە دروست دەبن.")
@@ -1414,12 +1566,24 @@ if res:
                 type=["mp4", "mov", "mkv", "webm", "avi"],
                 key=f"up_{res['id']}_{res['rev']}",
             )
+        rf_list = kurdish_fonts()
+        rf_saved = st.session_state.get("font_choice")
+        render_font = st.selectbox(
+            "فۆنتی ڤیدیۆ", rf_list, index=rf_list.index(rf_saved) if rf_saved in rf_list else 0,
+            key=f"rfont_{res['id']}",
+        )
+        render_bold = st.checkbox(
+            "پیتی ئەستوور (Bold)", value=st.session_state.get("bold_choice", True), key=f"rbold_{res['id']}"
+        )
         if st.button("دروستکردنی ڤیدیۆ بە ژێرنووسەوە", key=f"render_{res['id']}_{res['rev']}", use_container_width=True):
             cookies_path = cookies_from_secret()
+            st.session_state.font_choice = render_font
+            st.session_state.bold_choice = bool(render_bold)
             ropts = {
                 "layout": DEFAULTS["layout"],
                 "canvas_w": DEFAULTS["canvas_w"],
-                "font": DEFAULTS["font"],
+                "font": render_font,
+                "bold": bool(render_bold),
                 "cookies_path": cookies_path,
             }
             oldv = res.get("video_path")
