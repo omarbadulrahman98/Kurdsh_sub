@@ -22,6 +22,7 @@ st.set_page_config(page_title="ژێرنووسی کوردی", page_icon="🎬", l
 
 CLAUDE_MODEL = "claude-sonnet-5-5"   # وەرگێڕانی یەکەم
 POLISH_MODEL = "claude-opus-5-5"      # پێداچوونەوەی کۆتایی (باشترین کوالیتی)
+CLAUDE_WORKERS = 5       # چەند بەش هاوکات بۆ Claude دەنێردرێن
 CHUNK_SIZE = 30          # ژمارەی دێڕەکان لە هەر داواکارییەکی Claude
 MAX_VIDEOS = 10          # زۆرترین ژمارەی ڤیدیۆ لە یەک جار
 LINE_WIDTH = 42          # درێژی دێڕی ژێرنووس
@@ -318,14 +319,16 @@ def claude_models():
 
 
 def refine_claude(client, texts, drafts, title, src_code, glossary, on_progress, issues=None):
-    """پێداچوونەوەی دووەم: گرامەر، ڕێنووس، لابردنی وشەی نا-سۆرانی. ئەگەر شکستی هێنا، دەقی پێشوو دەگەڕێنێتەوە."""
+    """پێداچوونەوەی دووەم: گرامەر، ڕێنووس، لابردنی وشەی نا-سۆرانی. بەشەکان هاوکات دەنێردرێن."""
     results = list(drafts)
     translate_model, polish_model = claude_models()
     models = [polish_model] + ([translate_model] if translate_model != polish_model else [])
     gloss_text = "\n".join(f"{a} = {b}" for a, b in glossary)
-    total_chunks = max(1, (len(texts) + CHUNK_SIZE - 1) // CHUNK_SIZE)
+    starts = list(range(0, len(texts), CHUNK_SIZE))
+    total_chunks = max(1, len(starts))
+    progress = {"done": 0}
 
-    for c, start in enumerate(range(0, len(texts), CHUNK_SIZE)):
+    def do_chunk(start):
         idx = list(range(start, min(start + CHUNK_SIZE, len(texts))))
         payload = {}
         for i in idx:
@@ -363,18 +366,28 @@ def refine_claude(client, texts, drafts, title, src_code, glossary, on_progress,
                     time.sleep(2)
             if done:
                 break
-        if not done:
-            TRANSLATE_STATS["refine_failed_chunks"] += 1
-        on_progress((c + 1) / total_chunks)
+        with _TR_LOCK:
+            if not done:
+                TRANSLATE_STATS["refine_failed_chunks"] += 1
+            progress["done"] += 1
+            frac = progress["done"] / total_chunks
+        on_progress(frac)
+
+    if starts:
+        with ThreadPoolExecutor(max_workers=CLAUDE_WORKERS) as pool:
+            list(pool.map(do_chunk, starts))
     return results
 
 
 def translate_claude(client, texts, title, src_code, glossary, on_progress):
     results = [None] * len(texts)
     gloss_text = "\n".join(f"{a} = {b}" for a, b in glossary)
-    total_chunks = max(1, (len(texts) + CHUNK_SIZE - 1) // CHUNK_SIZE)
+    starts = list(range(0, len(texts), CHUNK_SIZE))
+    total_chunks = max(1, len(starts))
+    progress = {"done": 0}
+    model = claude_models()[0]
 
-    for c, start in enumerate(range(0, len(texts), CHUNK_SIZE)):
+    def do_chunk(start):
         idx = list(range(start, min(start + CHUNK_SIZE, len(texts))))
         payload = {str(i): texts[i] for i in idx}
         prompt = (
@@ -388,7 +401,7 @@ def translate_claude(client, texts, title, src_code, glossary, on_progress):
         for attempt in range(3):
             try:
                 msg = client.messages.create(
-                    model=claude_models()[0],
+                    model=model,
                     max_tokens=8000,
                     system=SYSTEM_PROMPT,
                     messages=[{"role": "user", "content": prompt}],
@@ -403,7 +416,14 @@ def translate_claude(client, texts, title, src_code, glossary, on_progress):
             except Exception as e:
                 TRANSLATE_STATS["claude_error"] = f"{type(e).__name__}: {e}"[:300]
                 time.sleep(2 * (attempt + 1))
-        on_progress((c + 1) / total_chunks)
+        with _TR_LOCK:
+            progress["done"] += 1
+            frac = progress["done"] / total_chunks
+        on_progress(frac)
+
+    if starts:
+        with ThreadPoolExecutor(max_workers=CLAUDE_WORKERS) as pool:
+            list(pool.map(do_chunk, starts))
 
     missing = [i for i, r in enumerate(results) if r is None]
     TRANSLATE_STATS["claude_fallback"] = len(missing)
@@ -604,13 +624,15 @@ def translate_rows(rows, title, opts, status, bar):
         import anthropic
 
         client = anthropic.Anthropic(api_key=opts["api_key"])
+        scale = 0.5 if opts.get("refine_all", True) else 1.0
         translated = translate_claude(
-            client, texts, title, opts["src_code"], glossary, lambda f: on_progress(0.5 * f)
+            client, texts, title, opts["src_code"], glossary, lambda f: on_progress(scale * f)
         )
-        bar.progress(0.85, text="خەریکی پێداچوونەوەی کوردییەکەم (گرامەر و ڕێنووس)...")
-        translated = refine_claude(
-            client, texts, translated, title, opts["src_code"], glossary, lambda f: on_progress(0.5 + 0.5 * f)
-        )
+        if opts.get("refine_all", True):
+            bar.progress(0.85, text="خەریکی پێداچوونەوەی کوردییەکەم (گرامەر و ڕێنووس)...")
+            translated = refine_claude(
+                client, texts, translated, title, opts["src_code"], glossary, lambda f: on_progress(0.5 + 0.5 * f)
+            )
     else:
         translated = translate_google(texts, opts["src_code"], on_progress)
         on_progress(1.0)
@@ -1022,7 +1044,8 @@ def render_video(url, df, title_text, opts, bar, upload=None, local_path=None):
             "ffmpeg", "-y", "-loglevel", "error", "-progress", "pipe:1", "-nostats",
             "-i", os.path.basename(src_path),
             "-vf", f"{base_vf},subtitles=subs.ass{fonts_opt}",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-preset", opts.get("preset", "veryfast"), "-crf", str(opts.get("crf", 23)),
+            "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
             out_path,
         ]
@@ -1212,9 +1235,10 @@ with tab_up:
         up_lang_label = st.selectbox("زمانی قسەکانی ڤیدیۆ", list(LANGS.keys()), index=len(LANGS) - 1)
         up_speed = st.selectbox(
             "خێرایی",
-            ["خێرا (کەمێک کەمتر وردە)", "وردتر (خاوتر)"],
+            ["خێرا (وەرگێڕانی یەک قۆناغ)", "وردتر (پێداچوونەوەی Opus، خاوتر)"],
             index=0,
         )
+        up_auto = st.checkbox("دوای ژێرنووس، ڤیدیۆکەش خۆکارانە دروست بکە", value=True)
         go_up = st.form_submit_button("ژێرنووسی کوردی دروست بکە", type="primary", use_container_width=True)
 
 with tab_yt:
@@ -1242,6 +1266,7 @@ if go_up:
             "src_code": LANGS[up_lang_label],
             "whisper_model": "base" if fast else DEFAULTS["whisper_model"],
             "beam_size": 1 if fast else 5,
+            "refine_all": not fast,
             "groq_key": secret("GROQ_API_KEY"),
             "engine": "claude" if api_key else "google",
             "api_key": api_key,
@@ -1249,7 +1274,8 @@ if go_up:
             "glossary": "",
         }
         up_obj = UploadedBytes(up_file.name, up_file.getvalue())
-        jid = start_job(lambda rep: process_upload(up_obj, uopts, rep, rep))
+        auto_info = {"auto_render": bool(up_auto), "fast": fast}
+        jid = start_job(lambda rep: process_upload(up_obj, uopts, rep, rep), meta=auto_info)
         st.query_params["job"] = jid
         st.rerun()
 
@@ -1257,6 +1283,25 @@ up_job, up_job_id = poll_job("job")
 if up_job is not None and st.session_state.get("loaded_job") != up_job_id:
     st.session_state.result = up_job["result"]
     st.session_state.loaded_job = up_job_id
+if up_job is not None and up_job["meta"].get("auto_render") and not up_job.get("render_started"):
+    up_job["render_started"] = True
+    res0 = up_job["result"]
+    fast0 = up_job["meta"].get("fast", True)
+    ropts0 = {
+        "layout": DEFAULTS["layout"],
+        "canvas_w": DEFAULTS["canvas_w"],
+        "font": DEFAULTS["font"],
+        "cookies_path": None,
+        "preset": "ultrafast" if fast0 else "veryfast",
+        "crf": 26 if fast0 else 23,
+    }
+    df0 = res0["df"].copy()
+    rjid0 = start_job(
+        lambda rep: render_video("", df0, res0["ku_title"], ropts0, rep, local_path=res0["local_path"]),
+        meta={"res_id": res0["id"]},
+    )
+    st.query_params["rjob"] = rjid0
+    st.rerun()
 
 if go:
     url = url.strip()
